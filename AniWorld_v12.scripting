@@ -1,363 +1,122 @@
-// AniWorld v12
-// Single-file Scripting app. Native TabView, caching, catalog/search,
-// anime details, episode lists, favourites and watch history.
-// Requires the Scripting iOS app and an active network connection.
-
+// AniWorld v12.0.2, single-file Scripting app
 import {
-  Button, ContentUnavailableView, Divider, HStack, Image, LazyVGrid,
-  Navigation, NavigationStack, ScrollView, Spacer, Tab, TabView, Text,
-  TextField, Toggle, VStack, ZStack, useEffect, useState, fetch
+  Button, Color, ContentUnavailableView, HStack, Image, LazyVGrid,
+  Navigation, NavigationStack, ScrollView, Tab, TabView, Text, TextField,
+  Toggle, VideoPlayer, VStack, ZStack, useEffect, useMemo, useState, fetch
 } from 'scripting'
 
-declare const Storage: {
-  get<T>(key: string): T | null
-  set<T>(key: string, value: T): boolean
-  remove(key: string): void
-}
-declare const Safari: { openURL(url: string): Promise<boolean> }
-declare const HapticFeedback: {
-  lightImpact(): void; mediumImpact(): void; selection(): void
-  notificationSuccess(): void; notificationError(): void
-}
+declare const Storage: { get<T>(key: string): T | null; set<T>(key: string, value: T): boolean; remove(key: string): void }
+declare const HapticFeedback: { lightImpact(): void; mediumImpact(): void; selection(): void; notificationSuccess(): void; notificationError(): void }
 
 const BASE = 'https://aniworld.to'
-const VERSION = '12.0.0'
-const KEY = {
-  cache: 'aniworld-v12-cache',
-  history: 'aniworld-v12-history',
-  watchlist: 'aniworld-v12-watchlist',
-  settings: 'aniworld-v12-settings'
-}
+const VERSION = '12.0.2'
+const KEY = { cache: 'aniworld-v12-cache', history: 'aniworld-v12-history', watchlist: 'aniworld-v12-watchlist', settings: 'aniworld-v12-settings' }
+const color = (value: string) => Color(value)
+const C = { bg: color('#000000'), surface: color('#1c1c1e'), surface2: color('#2c2c2e'), text: color('#ffffff'), secondary: color('#aeaeb2'), tertiary: color('#8e8e93'), accent: color('#ff453a'), green: color('#30d158') }
+const tap = { nav: () => { try { HapticFeedback.lightImpact() } catch {} }, select: () => { try { HapticFeedback.selection() } catch {} }, ok: () => { try { HapticFeedback.notificationSuccess() } catch {} }, fail: () => { try { HapticFeedback.notificationError() } catch {} } }
 
-const C = {
-  bg: '#000000', surface: '#1c1c1e', surface2: '#2c2c2e',
-  text: '#ffffff', secondary: '#aeaeb2', tertiary: '#8e8e93',
-  accent: '#ff453a', green: '#30d158', line: 'rgba(255,255,255,0.12)'
-}
-const haptic = {
-  nav: () => { try { HapticFeedback.lightImpact() } catch {} },
-  select: () => { try { HapticFeedback.selection() } catch {} },
-  destructive: () => { try { HapticFeedback.mediumImpact() } catch {} },
-  success: () => { try { HapticFeedback.notificationSuccess() } catch {} },
-  error: () => { try { HapticFeedback.notificationError() } catch {} }
-}
-
-class LRUCache<K, V> {
-  private map = new Map<K, V>()
-  constructor(private readonly maxSize: number) {}
-  get(key: K): V | undefined {
-    const value = this.map.get(key)
-    if (value === undefined) return undefined
-    this.map.delete(key); this.map.set(key, value)
-    return value
-  }
-  set(key: K, value: V) {
-    this.map.delete(key); this.map.set(key, value)
-    if (this.map.size > this.maxSize) this.map.delete(this.map.keys().next().value)
-  }
-  clear() { this.map.clear() }
-}
-
-type CacheEntry = { value: string; savedAt: number }
 type Anime = { slug: string; title: string; cover: string | null }
 type Detail = Anime & { description: string; genres: string[]; seasons: number[]; year: string | null; rating: string | null }
 type Episode = { number: number; title: string; season: number; film: boolean }
 type Stream = { hoster: string; language: string; href: string }
-type HistoryItem = { slug: string; title: string; season: number; episode: number; film: boolean; watchedAt: number }
-type Settings = { autoOpenProvider: boolean; showDebug: boolean }
+type History = { slug: string; title: string; season: number; episode: number; film: boolean; watchedAt: number }
+type Settings = { autoplay: boolean; debug: boolean }
+type Page = { value: string; savedAt: number }
 
-const memory = new LRUCache<string, CacheEntry>(120)
-let cacheDisk: Record<string, CacheEntry> | null = null
-let historyMemory: HistoryItem[] | null = null
-let watchlistMemory: Anime[] | null = null
-let settingsMemory: Settings | null = null
-const listeners = new Set<() => void>()
-function notify() { listeners.forEach(fn => { try { fn() } catch {} }) }
-function useStoreTick() {
-  const [tick, setTick] = useState(0)
-  useEffect(() => { const fn = () => setTick(value => value + 1); listeners.add(fn); return () => listeners.delete(fn) }, [])
-  return tick
-}
+let pageCache: Record<string, Page> | null = null
+let watchlist: Anime[] | null = null
+let history: History[] | null = null
+let settings: Settings | null = null
+const storeListeners = new Set<() => void>()
+const notify = () => storeListeners.forEach(listener => { try { listener() } catch {} })
+function useStoreTick() { const [tick, setTick] = useState(0); useEffect(() => { const listener = () => setTick(value => value + 1); storeListeners.add(listener); return () => storeListeners.delete(listener) }, []); return tick }
+function cachedPages() { if (!pageCache) pageCache = Storage.get<Record<string, Page>>(KEY.cache) || {}; return pageCache }
+function getHistory() { if (!history) history = Storage.get<History[]>(KEY.history) || []; return history }
+function getWatchlist() { if (!watchlist) watchlist = Storage.get<Anime[]>(KEY.watchlist) || []; return watchlist }
+function getSettings() { if (!settings) settings = { autoplay: true, debug: false, ...(Storage.get<Partial<Settings>>(KEY.settings) || {}) }; return settings }
+function saveHistory(next: History[]) { history = next.slice(0, 100); Storage.set(KEY.history, history); notify() }
+function addHistory(item: History) { saveHistory([item, ...getHistory().filter(x => !(x.slug === item.slug && x.season === item.season && x.episode === item.episode && x.film === item.film))]) }
+function saveWatchlist(next: Anime[]) { watchlist = next; Storage.set(KEY.watchlist, next); notify() }
+function toggleWatchlist(item: Anime) { const old = getWatchlist(); saveWatchlist(old.some(x => x.slug === item.slug) ? old.filter(x => x.slug !== item.slug) : [item, ...old]) }
+function saveSettings(next: Settings) { settings = next; Storage.set(KEY.settings, next); notify() }
+function clearCache() { pageCache = {}; Storage.set(KEY.cache, {}); notify() }
 
-function diskCache(): Record<string, CacheEntry> {
-  if (cacheDisk === null) cacheDisk = Storage.get<Record<string, CacheEntry>>(KEY.cache) || {}
-  return cacheDisk
-}
-function cached(key: string, ttl: number): string | null {
-  const now = Date.now(); const ram = memory.get(key)
-  if (ram && now - ram.savedAt < ttl) return ram.value
-  const disk = diskCache()[key]
-  if (!disk || now - disk.savedAt >= ttl) return null
-  memory.set(key, disk); return disk.value
-}
-function putCache(key: string, value: string) {
-  const entry = { value, savedAt: Date.now() }
-  memory.set(key, entry); diskCache()[key] = entry
-  Storage.set(KEY.cache, diskCache())
-}
-function clearCache() { cacheDisk = {}; memory.clear(); Storage.set(KEY.cache, {}); notify() }
+function absolute(path: string) { return path.startsWith('http') ? path : BASE + (path.startsWith('/') ? path : '/' + path) }
+function decode(value: string) { return (value || '').replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#039;|&apos;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&auml;/g, 'ä').replace(/&ouml;/g, 'ö').replace(/&uuml;/g, 'ü').replace(/&Auml;/g, 'Ä').replace(/&Ouml;/g, 'Ö').replace(/&Uuml;/g, 'Ü').replace(/&szlig;/g, 'ß').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim() }
+function titleFromSlug(slug: string) { return slug.replace(/-/g, ' ').replace(/\b\w/g, char => char.toUpperCase()) }
+function matches(text: string, pattern: RegExp) { const flags = pattern.flags.includes('g') ? pattern.flags : pattern.flags + 'g'; const re = new RegExp(pattern.source, flags); const out: RegExpExecArray[] = []; let match: RegExpExecArray | null; while ((match = re.exec(text))) out.push(match); return out }
+function cover(block: string): string | null { const match = block.match(/(?:data-src|src)=["']([^"']+(?:\/cover\/|\/uploads\/)[^"']+\.(?:jpg|jpeg|png|webp)[^"']*)["']/i); return match ? absolute(match[1].replace(/&amp;/g, '&')) : null }
 
-function getHistory(): HistoryItem[] {
-  if (!historyMemory) historyMemory = Storage.get<HistoryItem[]>(KEY.history) || []
-  return historyMemory
-}
-function saveHistory(items: HistoryItem[]) { historyMemory = items.slice(0, 100); Storage.set(KEY.history, historyMemory); notify() }
-function addHistory(item: HistoryItem) {
-  const rest = getHistory().filter(x => !(x.slug === item.slug && x.season === item.season && x.episode === item.episode && x.film === item.film))
-  saveHistory([item, ...rest])
-}
-function clearHistory() { saveHistory([]) }
-function getWatchlist(): Anime[] {
-  if (!watchlistMemory) watchlistMemory = Storage.get<Anime[]>(KEY.watchlist) || []
-  return watchlistMemory
-}
-function saveWatchlist(items: Anime[]) { watchlistMemory = items; Storage.set(KEY.watchlist, items); notify() }
-function inWatchlist(slug: string) { return getWatchlist().some(item => item.slug === slug) }
-function toggleWatchlist(anime: Anime) {
-  const old = getWatchlist()
-  if (old.some(item => item.slug === anime.slug)) saveWatchlist(old.filter(item => item.slug !== anime.slug))
-  else saveWatchlist([anime, ...old])
-}
-function getSettings(): Settings {
-  if (!settingsMemory) settingsMemory = { autoOpenProvider: false, showDebug: false, ...(Storage.get<Partial<Settings>>(KEY.settings) || {}) }
-  return settingsMemory
-}
-function saveSettings(settings: Settings) { settingsMemory = settings; Storage.set(KEY.settings, settings); notify() }
-
-function decodeHtml(value: string): string {
-  return (value || '')
-    .replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#039;/g, "'")
-    .replace(/&apos;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>')
-    .replace(/&auml;/g, 'ä').replace(/&ouml;/g, 'ö').replace(/&uuml;/g, 'ü')
-    .replace(/&Auml;/g, 'Ä').replace(/&Ouml;/g, 'Ö').replace(/&Uuml;/g, 'Ü')
-    .replace(/&szlig;/g, 'ß').replace(/&nbsp;/g, ' ').replace(/\s+/g, ' ').trim()
-}
-function titleFromSlug(slug: string) { return slug.replace(/-/g, ' ').replace(/\b\w/g, c => c.toUpperCase()) }
-function absolute(url: string) { return url.startsWith('http') ? url : BASE + (url.startsWith('/') ? url : '/' + url) }
-function matchAll(input: string, expression: RegExp): RegExpExecArray[] {
-  const result: RegExpExecArray[] = []
-  const flags = expression.flags.includes('g') ? expression.flags : expression.flags + 'g'
-  const regexp = new RegExp(expression.source, flags)
-  let match: RegExpExecArray | null
-  while ((match = regexp.exec(input)) !== null) result.push(match)
-  return result
-}
-function coverFrom(block: string): string | null {
-  const result = block.match(/(?:data-src|src)=["']([^"']+(?:\/cover\/|\/uploads\/)[^"']+\.(?:jpg|jpeg|png|webp)[^"']*)["']/i)
-  return result ? absolute(result[1].replace(/&amp;/g, '&')) : null
-}
-function cleanTitle(value: string) { return decodeHtml(value).replace(/\s+(?:als\s+Stream.*|stream\s+online.*)$/i, '').trim() }
-
-async function getHtml(path: string, ttl = 10 * 60 * 1000): Promise<string> {
-  const url = absolute(path); const key = 'html:' + url
-  const existing = cached(key, ttl); if (existing) return existing
-  const response: any = await fetch(url, {
-    method: 'GET', timeout: 25,
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Safari/604.1',
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-      'Accept-Language': 'de-DE,de;q=0.9,en;q=0.7'
-    }
-  })
+async function html(path: string, ttl = 600000): Promise<string> {
+  const url = absolute(path), key = 'html:' + url, previous = cachedPages()[key], now = Date.now()
+  if (previous && now - previous.savedAt < ttl) return previous.value
+  const response: any = await fetch(url, { method: 'GET', timeout: 25, headers: { 'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Safari/604.1', 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', 'Accept-Language': 'de-DE,de;q=0.9,en;q=0.7' } })
   if (!response || response.ok === false) throw new Error('HTTP ' + (response?.status || 'Netzwerkfehler'))
-  const html = await response.text()
-  if (!html || html.length < 100) throw new Error('Leere Antwort')
-  if (/captcha|just a moment|cf-browser-verification/i.test(html)) throw new Error('Die Website verlangt eine Browser-Prüfung')
-  putCache(key, html); return html
+  const value = await response.text()
+  if (!value || value.length < 100) throw new Error('Leere Antwort')
+  if (/captcha|just a moment|cf-browser-verification/i.test(value)) throw new Error('Die Website verlangt eine Browser-Prüfung')
+  cachedPages()[key] = { value, savedAt: now }; Storage.set(KEY.cache, cachedPages()); return value
 }
-
-function parseCards(html: string): Anime[] {
-  const animes: Anime[] = []; const seen = new Set<string>()
-  for (const match of matchAll(html, /href=["']\/anime\/stream\/([^"'\/]+)["'][^>]*(?:title=["']([^"']*)["'])?[^>]*>/gi)) {
-    const slug = match[1]
-    if (seen.has(slug)) continue
-    seen.add(slug)
-    const pos = html.indexOf(match[0])
-    const block = html.slice(Math.max(0, pos - 320), Math.min(html.length, pos + 1100))
-    const titleFromStrong = block.match(/<strong[^>]*>([\s\S]*?)<\/strong>/i)
-    const title = cleanTitle(match[2] || titleFromStrong?.[1]?.replace(/<[^>]+>/g, '') || titleFromSlug(slug))
-    animes.push({ slug, title, cover: coverFrom(block) })
+function cards(source: string): Anime[] {
+  const out: Anime[] = [], seen = new Set<string>()
+  for (const match of matches(source, /href=["']\/anime\/stream\/([^"'\/]+)["'][^>]*(?:title=["']([^"']*)["'])?[^>]*>/gi)) {
+    const slug = match[1]; if (seen.has(slug)) continue; seen.add(slug)
+    const at = source.indexOf(match[0]), block = source.slice(Math.max(0, at - 350), at + 1100)
+    const strong = block.match(/<strong[^>]*>([\s\S]*?)<\/strong>/i)?.[1]
+    out.push({ slug, title: decode(match[2] || strong || titleFromSlug(slug)), cover: cover(block) })
   }
-  return animes
+  return out
 }
-async function fetchHome(): Promise<Anime[]> { return parseCards(await getHtml('/', 20 * 60 * 1000)).slice(0, 36) }
-async function fetchCatalog(letter: string): Promise<Anime[]> { return parseCards(await getHtml('/katalog/' + encodeURIComponent(letter), 24 * 60 * 60 * 1000)) }
-async function searchAnime(query: string): Promise<Anime[]> {
-  const q = query.trim(); if (q.length < 2) return []
-  const slug = q.toLowerCase().replace(/[^a-z0-9äöüß]+/g, '-')
-  const first = /^[a-z]/i.test(q[0]) ? q[0].toUpperCase() : '0-9'
-  const catalog = await fetchCatalog(first)
-  const words = q.toLowerCase().split(/\s+/).filter(Boolean)
-  const filtered = catalog.filter(item => words.every(word => item.title.toLowerCase().includes(word) || item.slug.includes(word)))
-  if (filtered.length) return filtered.slice(0, 40)
-  try {
-    const direct = await getHtml('/anime/stream/' + slug, 24 * 60 * 60 * 1000)
-    const detail = parseDetail(direct, slug)
-    return detail ? [detail] : []
-  } catch { return [] }
+function detail(source: string, slug: string): Detail | null {
+  const heading = source.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i); if (!heading) return null
+  const description = source.match(/(?:class=["'][^"']*description[^"']*["'][^>]*>|data-full-description=["'])([\s\S]{0,2500}?)(?:<\/p>|<\/span>|["'])/i)?.[1] || ''
+  const genres = Array.from(new Set(matches(source, /href=["']\/genre\/[^"']+["'][^>]*>([^<]+)<\/a>/gi).map(match => decode(match[1])))).slice(0, 16)
+  const seasons = Array.from(new Set(matches(source, /\/staffel-(\d+)/gi).map(match => Number(match[1])))).sort((a, b) => a - b)
+  return { slug, title: decode(heading[1]) || titleFromSlug(slug), cover: cover(source), description: decode(description).slice(0, 1500), genres, seasons: seasons.length ? seasons : [1], year: source.match(/\/animes\/jahr\/(\d{4})/i)?.[1] || null, rating: source.match(/(\d(?:[.,]\d)?)\s*\/\s*5/i)?.[1]?.replace(',', '.') || null }
 }
-function parseDetail(html: string, slug: string): Detail | null {
-  const heading = html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i)
-  if (!heading) return null
-  const title = cleanTitle(heading[1].replace(/<[^>]+>/g, '')) || titleFromSlug(slug)
-  const descriptionMatch = html.match(/(?:class=["'][^"']*description[^"']*["'][^>]*>|data-full-description=["'])([\s\S]{0,2500}?)(?:<\/p>|<\/span>|["'])/i)
-  const description = decodeHtml((descriptionMatch?.[1] || '').replace(/<[^>]+>/g, ' ')).slice(0, 1500)
-  const genres = Array.from(new Set(matchAll(html, /href=["']\/genre\/[^"']+["'][^>]*>([^<]+)<\/a>/gi).map(m => decodeHtml(m[1])))).slice(0, 16)
-  const seasons = Array.from(new Set(matchAll(html, /\/staffel-(\d+)/gi).map(m => Number(m[1])))).sort((a, b) => a - b)
-  const year = html.match(/\/animes\/jahr\/(\d{4})/i)?.[1] || null
-  const rating = html.match(/(\d(?:[.,]\d)?)\s*\/\s*5/i)?.[1]?.replace(',', '.') || null
-  return { slug, title, cover: coverFrom(html), description, genres, seasons: seasons.length ? seasons : [1], year, rating }
-}
-async function fetchDetail(slug: string): Promise<Detail> {
-  const html = await getHtml('/anime/stream/' + encodeURIComponent(slug), 24 * 60 * 60 * 1000)
-  const detail = parseDetail(html, slug)
-  if (!detail) throw new Error('Anime konnte nicht gelesen werden')
-  return detail
-}
-async function fetchEpisodes(slug: string, season: number): Promise<Episode[]> {
-  const suffix = season === 0 ? '/filme' : '/staffel-' + season
-  const html = await getHtml('/anime/stream/' + encodeURIComponent(slug) + suffix, 24 * 60 * 60 * 1000)
-  const expression = season === 0
-    ? /href=["']\/anime\/stream\/[^"']+\/filme\/film-(\d+)["'][^>]*>([\s\S]{0,700}?)(?:<\/a>|$)/gi
-    : /href=["']\/anime\/stream\/[^"']+\/staffel-\d+\/episode-(\d+)["'][^>]*>([\s\S]{0,700}?)(?:<\/a>|$)/gi
-  const out: Episode[] = []; const seen = new Set<number>()
-  for (const match of matchAll(html, expression)) {
-    const number = Number(match[1]); if (!number || seen.has(number)) continue
-    seen.add(number)
-    const strong = match[2].match(/<strong[^>]*>([\s\S]*?)<\/strong>/i)?.[1]
-    out.push({ number, title: cleanTitle((strong || '').replace(/<[^>]+>/g, '')) || (season === 0 ? 'Film ' : 'Episode ') + number, season, film: season === 0 })
-  }
+async function home() { return cards(await html('/', 1200000)).slice(0, 36) }
+async function search(query: string) { const q = query.trim(); if (q.length < 2) return []; const catalog = cards(await html('/katalog/' + encodeURIComponent(/^[a-z]/i.test(q[0]) ? q[0].toUpperCase() : '0-9'), 86400000)); const words = q.toLowerCase().split(/\s+/); return catalog.filter(item => words.every(word => item.title.toLowerCase().includes(word) || item.slug.includes(word))).slice(0, 40) }
+async function loadDetail(slug: string) { const parsed = detail(await html('/anime/stream/' + encodeURIComponent(slug), 86400000), slug); if (!parsed) throw new Error('Anime konnte nicht gelesen werden'); return parsed }
+async function episodes(slug: string, season: number): Promise<Episode[]> {
+  const source = await html('/anime/stream/' + encodeURIComponent(slug) + (season === 0 ? '/filme' : '/staffel-' + season), 86400000)
+  const pattern = season === 0 ? /href=["']\/anime\/stream\/[^"']+\/filme\/film-(\d+)["'][^>]*>([\s\S]{0,700}?)(?:<\/a>|$)/gi : /href=["']\/anime\/stream\/[^"']+\/staffel-\d+\/episode-(\d+)["'][^>]*>([\s\S]{0,700}?)(?:<\/a>|$)/gi
+  const out: Episode[] = [], seen = new Set<number>()
+  for (const match of matches(source, pattern)) { const number = Number(match[1]); if (!number || seen.has(number)) continue; seen.add(number); out.push({ number, title: decode(match[2].match(/<strong[^>]*>([\s\S]*?)<\/strong>/i)?.[1] || '') || (season === 0 ? 'Film ' : 'Episode ') + number, season, film: season === 0 }) }
   return out.sort((a, b) => a.number - b.number)
 }
-async function fetchStreams(slug: string, season: number, episode: number, film: boolean): Promise<Stream[]> {
-  const suffix = film ? '/filme/film-' + episode : '/staffel-' + season + '/episode-' + episode
-  const html = await getHtml('/anime/stream/' + encodeURIComponent(slug) + suffix, 3 * 60 * 1000)
-  const streams: Stream[] = []; const seen = new Set<string>()
-  const languageMap: Record<string, string> = { '1': 'Deutsch Dub', '2': 'Englisch Sub', '3': 'Deutsch Sub', '4': 'Englisch Dub' }
-  for (const match of matchAll(html, /<li\b[^>]*data-lang-key=["'](\d+)["'][^>]*data-link-target=["']([^"']+)["'][^>]*>([\s\S]*?)<\/li>/gi)) {
-    const hoster = decodeHtml(match[3].match(/<h4[^>]*>([^<]+)<\/h4>/i)?.[1] || 'Hoster')
-    const href = absolute(match[2]); const key = hoster + '|' + href
-    if (seen.has(key)) continue
-    seen.add(key); streams.push({ hoster, language: languageMap[match[1]] || 'Sprache ' + match[1], href })
-  }
-  return streams
+async function streams(slug: string, season: number, episode: number, film: boolean): Promise<Stream[]> {
+  const source = await html('/anime/stream/' + encodeURIComponent(slug) + (film ? '/filme/film-' + episode : '/staffel-' + season + '/episode-' + episode), 180000)
+  const languages: Record<string, string> = { '1': 'Deutsch Dub', '2': 'Englisch Sub', '3': 'Deutsch Sub', '4': 'Englisch Dub' }, out: Stream[] = [], seen = new Set<string>()
+  for (const match of matches(source, /<li\b[^>]*data-lang-key=["'](\d+)["'][^>]*data-link-target=["']([^"']+)["'][^>]*>([\s\S]*?)<\/li>/gi)) { const hoster = decode(match[3].match(/<h4[^>]*>([^<]+)<\/h4>/i)?.[1] || 'Hoster'), href = absolute(match[2]), key = hoster + '|' + href; if (!seen.has(key)) { seen.add(key); out.push({ hoster, language: languages[match[1]] || 'Sprache ' + match[1], href }) } }
+  return out
 }
 
-function openDetail(slug: string) { haptic.nav(); Navigation.present({ element: <NavigationStack><DetailScreen slug={slug} /></NavigationStack> }) }
-function openStreamList(slug: string, season: number, episode: number, film: boolean) { haptic.nav(); Navigation.present({ element: <NavigationStack><StreamScreen slug={slug} season={season} episode={episode} film={film} /></NavigationStack> }) }
+function openDetail(slug: string) { tap.nav(); Navigation.present({ element: <NavigationStack><DetailScreen slug={slug} /></NavigationStack> }) }
+function openStreams(slug: string, season: number, episode: number, film: boolean) { tap.nav(); Navigation.present({ element: <NavigationStack><StreamScreen slug={slug} season={season} episode={episode} film={film} /></NavigationStack> }) }
+function openPlayer(stream: Stream, title: string, season: number, episode: number, film: boolean) { tap.nav(); Navigation.present({ element: <PlayerScreen stream={stream} title={title} season={season} episode={episode} film={film} autoplay={getSettings().autoplay} /> }) }
 
-const Poster = ({ anime, small = false, onTap }: { anime: Anime; small?: boolean; onTap: () => void }) => (
-  <Button action={onTap}>
-    <VStack alignment="leading" spacing={7} frame={{ width: small ? 112 : undefined }}>
-      <ZStack frame={{ width: small ? 112 : undefined, height: small ? 164 : 152 }} background={C.surface2}>
-        <Image systemName="play.rectangle.fill" foregroundStyle={C.tertiary} font="title" />
-      </ZStack>
-      <Text font="footnote" bold foregroundStyle={C.text} lineLimit={2} frame={{ maxWidth: 'infinity', alignment: 'leading' }}>{anime.title}</Text>
-    </VStack>
-  </Button>
-)
-const Loading = ({ label = 'Lade Inhalte …' }: { label?: string }) => <VStack padding={40} spacing={12} frame={{ maxWidth: 'infinity' }}><Image systemName="arrow.triangle.2.circlepath" foregroundStyle={C.secondary} font="title2" /><Text foregroundStyle={C.secondary}>{label}</Text></VStack>
-const ErrorState = ({ message, retry }: { message: string; retry: () => void }) => <VStack padding={32} spacing={14} frame={{ maxWidth: 'infinity' }}><Image systemName="exclamationmark.triangle" foregroundStyle={C.accent} font="title" /><Text foregroundStyle={C.secondary} multilineTextAlignment="center">{message}</Text><Button title="Erneut versuchen" action={retry} /></VStack>
+const Poster = ({ anime, onTap }: { anime: Anime; onTap: () => void }) => <Button action={onTap}><VStack alignment="leading" spacing={7}><ZStack frame={{ height: 152 }} background={C.surface2}><Image systemName="play.rectangle.fill" foregroundStyle={C.tertiary} font="title" /></ZStack><Text font="footnote" bold foregroundStyle={C.text} lineLimit={2}>{anime.title}</Text></VStack></Button>
+const Loading = ({ label = 'Lade Inhalte …' }: { label?: string }) => <VStack padding={40} spacing={12}><Image systemName="arrow.triangle.2.circlepath" foregroundStyle={C.secondary} font="title2" /><Text foregroundStyle={C.secondary}>{label}</Text></VStack>
+const Failure = ({ message, retry }: { message: string; retry: () => void }) => <VStack padding={32} spacing={14}><Image systemName="exclamationmark.triangle" foregroundStyle={C.accent} font="title" /><Text foregroundStyle={C.secondary} multilineTextAlignment="center">{message}</Text><Button title="Erneut versuchen" action={retry} /></VStack>
 
-const HomeTab = () => {
-  const [items, setItems] = useState<Anime[]>([]), [loading, setLoading] = useState(true), [error, setError] = useState('')
-  const load = async () => { setLoading(true); setError(''); try { setItems(await fetchHome()) } catch (e) { setError(String(e)) } finally { setLoading(false) } }
-  useEffect(() => { load() }, [])
-  return <NavigationStack><ScrollView navigationTitle="AniWorld" background={C.bg} toolbar={{ confirmationAction: <Button action={() => { clearCache(); load() }}><Image systemName="arrow.clockwise" foregroundStyle={C.text} /></Button> }}>
-    <VStack padding={{ horizontal: 16, bottom: 100 }} spacing={16} alignment="leading">
-      <Text font="title3" bold foregroundStyle={C.text}>Entdecken</Text>
-      {loading ? <Loading /> : error ? <ErrorState message={error} retry={load} /> : <LazyVGrid columns={[{ size: { type: 'flexible' }, spacing: 12 }, { size: { type: 'flexible' }, spacing: 12 }, { size: { type: 'flexible' } }]} spacing={22}>{items.map(anime => <Poster key={anime.slug} anime={anime} onTap={() => openDetail(anime.slug)} />)}</LazyVGrid>}
-    </VStack>
-  </ScrollView></NavigationStack>
+const PlayerScreen = ({ stream, title, season, episode, film, autoplay }: { stream: Stream; title: string; season: number; episode: number; film: boolean; autoplay: boolean }) => {
+  const dismiss = Navigation.useDismiss(), player = useMemo(() => new AVPlayer(), [stream.href])
+  const [state, setState] = useState('paused'), [ready, setReady] = useState(false), [error, setError] = useState('')
+  const load = async () => { setError(''); setReady(false); player.onTimeControlStatusChanged = (next: unknown) => setState(String(next)); player.onError = (message: string) => { setReady(false); setError(message || 'Die Quelle konnte nicht wiedergegeben werden.') }; player.onEnded = () => setState('paused'); player.onReadyToPlay = () => { setReady(true); if (autoplay) player.play() }; try { await SharedAudioSession.setCategory('playback', ['mixWithOthers']); await SharedAudioSession.setActive(true) } catch {}; if (!player.setSource(stream.href)) setError('Die Quelle liefert keine kompatible Medienadresse.') }
+  useEffect(() => { load(); return () => { try { player.pause(); player.dispose() } catch {} } }, [player])
+  const playPause = () => { if (state === 'playing') player.pause(); else if (!player.play() && ready) setError('Die Wiedergabe konnte nicht gestartet werden.') }
+  const label = film ? 'Film ' + episode : 'S' + season + ' · E' + episode
+  return <NavigationStack><VStack navigationTitle={title} navigationBarTitleDisplayMode="inline" background={C.bg} spacing={14} toolbar={{ cancellationAction: <Button title="Schließen" action={dismiss} /> }}><VideoPlayer player={player} frame={{ height: 260 }} /><VStack padding={{ horizontal: 16, bottom: 28 }} alignment="leading" spacing={12}><Text font="headline" bold foregroundStyle={C.text}>{label}</Text><Text font="caption" foregroundStyle={C.secondary}>{stream.hoster} · {stream.language}</Text>{error ? <Failure message={error} retry={load} /> : <Text font="caption" foregroundStyle={ready ? C.green : C.secondary}>{ready ? (state === 'playing' ? 'Wiedergabe läuft' : 'Bereit zur Wiedergabe') : 'Quelle wird geladen …'}</Text>}<HStack spacing={10}><Button title={state === 'playing' ? 'Pause' : 'Abspielen'} action={playPause} /><Button title="Neu laden" action={load} /></HStack></VStack></VStack></NavigationStack>
 }
 
-const SearchTab = () => {
-  const [query, setQuery] = useState(''), [items, setItems] = useState<Anime[]>([]), [loading, setLoading] = useState(false), [error, setError] = useState('')
-  const submit = async () => { const q = query.trim(); if (q.length < 2) return; haptic.select(); setLoading(true); setError(''); try { setItems(await searchAnime(q)) } catch (e) { setError(String(e)) } finally { setLoading(false) } }
-  return <NavigationStack><ScrollView navigationTitle="Suche" background={C.bg}>
-    <VStack padding={{ horizontal: 16, bottom: 100 }} spacing={16} alignment="leading">
-      <HStack spacing={10}><TextField title="Anime suchen" text={query} onChanged={setQuery} onSubmit={submit} frame={{ maxWidth: 'infinity' }} /><Button action={submit}><Image systemName="magnifyingglass" foregroundStyle={C.accent} font="title3" /></Button></HStack>
-      {loading ? <Loading label="Durchsuche den Katalog …" /> : error ? <ErrorState message={error} retry={submit} /> : items.length ? <LazyVGrid columns={[{ size: { type: 'flexible' }, spacing: 12 }, { size: { type: 'flexible' }, spacing: 12 }, { size: { type: 'flexible' } }]} spacing={22}>{items.map(anime => <Poster key={anime.slug} anime={anime} onTap={() => openDetail(anime.slug)} />)}</LazyVGrid> : <ContentUnavailableView title="Anime finden" systemImage="magnifyingglass" description="Gib mindestens zwei Zeichen ein und tippe auf Suchen." />}
-    </VStack>
-  </ScrollView></NavigationStack>
-}
+const HomeTab = () => { const [items, setItems] = useState<Anime[]>([]), [busy, setBusy] = useState(true), [error, setError] = useState(''); const load = async () => { setBusy(true); setError(''); try { setItems(await home()) } catch (e) { setError(String(e)) } finally { setBusy(false) } }; useEffect(() => { load() }, []); return <NavigationStack><ScrollView navigationTitle="AniWorld" background={C.bg} toolbar={{ confirmationAction: <Button action={() => { clearCache(); load() }}><Image systemName="arrow.clockwise" foregroundStyle={C.text} /></Button> }}><VStack padding={{ horizontal: 16, bottom: 100 }} spacing={16} alignment="leading"><Text font="title3" bold foregroundStyle={C.text}>Entdecken</Text>{busy ? <Loading /> : error ? <Failure message={error} retry={load} /> : <LazyVGrid columns={[{ size: { type: 'flexible' }, spacing: 12 }, { size: { type: 'flexible' }, spacing: 12 }, { size: { type: 'flexible' } }]} spacing={22}>{items.map(item => <Poster key={item.slug} anime={item} onTap={() => openDetail(item.slug)} />)}</LazyVGrid>}</VStack></ScrollView></NavigationStack> }
+const SearchTab = () => { const [query, setQuery] = useState(''), [items, setItems] = useState<Anime[]>([]), [busy, setBusy] = useState(false), [error, setError] = useState(''); const submit = async () => { if (query.trim().length < 2) return; tap.select(); setBusy(true); setError(''); try { setItems(await search(query)) } catch (e) { setError(String(e)) } finally { setBusy(false) } }; return <NavigationStack><ScrollView navigationTitle="Suche" background={C.bg}><VStack padding={{ horizontal: 16, bottom: 100 }} spacing={16} alignment="leading"><HStack spacing={10}><TextField title="Anime suchen" text={query} onChanged={setQuery} onSubmit={submit} frame={{ maxWidth: 'infinity' }} /><Button action={submit}><Image systemName="magnifyingglass" foregroundStyle={C.accent} font="title3" /></Button></HStack>{busy ? <Loading label="Durchsuche den Katalog …" /> : error ? <Failure message={error} retry={submit} /> : items.length ? <LazyVGrid columns={[{ size: { type: 'flexible' }, spacing: 12 }, { size: { type: 'flexible' }, spacing: 12 }, { size: { type: 'flexible' } }]} spacing={22}>{items.map(item => <Poster key={item.slug} anime={item} onTap={() => openDetail(item.slug)} />)}</LazyVGrid> : <ContentUnavailableView title="Anime finden" systemImage="magnifyingglass" description="Gib mindestens zwei Zeichen ein und tippe auf Suchen." />}</VStack></ScrollView></NavigationStack> }
+const WatchlistTab = () => { useStoreTick(); const items = getWatchlist(); return <NavigationStack><ScrollView navigationTitle="Watchlist" background={C.bg}><VStack padding={{ horizontal: 16, bottom: 100 }} spacing={16} alignment="leading">{items.length ? <LazyVGrid columns={[{ size: { type: 'flexible' }, spacing: 12 }, { size: { type: 'flexible' }, spacing: 12 }, { size: { type: 'flexible' } }]} spacing={22}>{items.map(item => <Poster key={item.slug} anime={item} onTap={() => openDetail(item.slug)} />)}</LazyVGrid> : <ContentUnavailableView title="Noch keine Watchlist" systemImage="bookmark" description="Öffne ein Anime und tippe auf das Lesezeichen." />}</VStack></ScrollView></NavigationStack> }
+const HistoryTab = () => { useStoreTick(); const items = getHistory(); return <NavigationStack><ScrollView navigationTitle="Verlauf" background={C.bg} toolbar={{ confirmationAction: items.length ? <Button title="Leeren" foregroundStyle={C.accent} action={() => saveHistory([])} /> : undefined }}><VStack padding={{ horizontal: 16, bottom: 100 }} spacing={12} alignment="leading">{items.length ? items.map(item => <Button key={item.slug + item.season + item.episode} action={() => openStreams(item.slug, item.season, item.episode, item.film)}><HStack padding={14} spacing={12} background={C.surface}><Image systemName="clock.arrow.circlepath" foregroundStyle={C.accent} font="title3" /><VStack alignment="leading" spacing={3} frame={{ maxWidth: 'infinity' }}><Text bold foregroundStyle={C.text} lineLimit={1}>{item.title}</Text><Text font="caption" foregroundStyle={C.secondary}>{item.film ? 'Film ' : 'S' + item.season + ' · E'}{item.episode}</Text></VStack><Image systemName="chevron.right" foregroundStyle={C.tertiary} font="caption" /></HStack></Button>) : <ContentUnavailableView title="Noch kein Verlauf" systemImage="clock" description="Hier erscheinen geöffnete Episoden." />}</VStack></ScrollView></NavigationStack> }
+const MoreTab = () => { useStoreTick(); const current = getSettings(), [autoplay, setAutoplay] = useState(current.autoplay), [debug, setDebug] = useState(current.debug); const set = (change: Partial<Settings>) => saveSettings({ ...getSettings(), ...change }); return <NavigationStack><ScrollView navigationTitle="Mehr" background={C.bg}><VStack padding={{ horizontal: 16, bottom: 100 }} spacing={20} alignment="leading"><VStack padding={16} spacing={12} alignment="leading" background={C.surface}><Text font="headline" bold foregroundStyle={C.text}>Wiedergabe</Text><Toggle title="Wiedergabe automatisch starten" isOn={autoplay} onChanged={value => { setAutoplay(value); set({ autoplay: value }); tap.select() }} /></VStack><VStack padding={16} spacing={12} alignment="leading" background={C.surface}><Text font="headline" bold foregroundStyle={C.text}>Entwicklung</Text><Toggle title="Debug-Hinweise" isOn={debug} onChanged={value => { setDebug(value); set({ debug: value }); tap.select() }} /><Button title="Cache leeren" foregroundStyle={C.accent} action={clearCache} /></VStack><VStack spacing={5} alignment="leading"><Text foregroundStyle={C.secondary}>AniWorld v{VERSION}</Text><Text font="caption" foregroundStyle={C.tertiary}>Single-File Scripting-App mit nativem In-App-Player.</Text></VStack></VStack></ScrollView></NavigationStack> }
 
-const WatchlistTab = () => {
-  useStoreTick(); const items = getWatchlist()
-  return <NavigationStack><ScrollView navigationTitle="Watchlist" background={C.bg}>
-    <VStack padding={{ horizontal: 16, bottom: 100 }} spacing={16} alignment="leading">
-      {items.length ? <LazyVGrid columns={[{ size: { type: 'flexible' }, spacing: 12 }, { size: { type: 'flexible' }, spacing: 12 }, { size: { type: 'flexible' } }]} spacing={22}>{items.map(anime => <Poster key={anime.slug} anime={anime} onTap={() => openDetail(anime.slug)} />)}</LazyVGrid> : <ContentUnavailableView title="Noch keine Watchlist" systemImage="bookmark" description="Öffne ein Anime und tippe auf das Lesezeichen." />}
-    </VStack>
-  </ScrollView></NavigationStack>
-}
+const DetailScreen = ({ slug }: { slug: string }) => { const [item, setItem] = useState<Detail | null>(null), [season, setSeason] = useState(1), [list, setList] = useState<Episode[]>([]), [busy, setBusy] = useState(true), [error, setError] = useState(''), [saved, setSaved] = useState(inWatchlist(slug)); const load = async () => { setBusy(true); setError(''); try { const next = await loadDetail(slug); const selected = next.seasons[0] || 1; setItem(next); setSeason(selected); setList(await episodes(slug, selected)) } catch (e) { setError(String(e)) } finally { setBusy(false) } }; const choose = async (next: number) => { tap.select(); setSeason(next); setList([]); try { setList(await episodes(slug, next)) } catch (e) { setError(String(e)) } }; useEffect(() => { load() }, [slug]); if (busy) return <ScrollView navigationTitle="Anime" background={C.bg}><Loading /></ScrollView>; if (!item || error) return <ScrollView navigationTitle="Anime" background={C.bg}><Failure message={error || 'Nicht gefunden'} retry={load} /></ScrollView>; return <ScrollView navigationTitle={item.title} background={C.bg} toolbar={{ confirmationAction: <Button action={() => { toggleWatchlist(item); setSaved(!saved); tap.ok() }}><Image systemName={saved ? 'bookmark.fill' : 'bookmark'} foregroundStyle={C.accent} /></Button> }}><VStack padding={{ horizontal: 16, bottom: 50 }} spacing={16} alignment="leading"><ZStack frame={{ height: 220 }} background={C.surface2}><Image systemName="play.rectangle.fill" foregroundStyle={C.tertiary} font="title" /></ZStack><Text font="title2" bold foregroundStyle={C.text}>{item.title}</Text><HStack spacing={10}>{item.year ? <Text font="caption" foregroundStyle={C.secondary}>{item.year}</Text> : null}{item.rating ? <Text font="caption" foregroundStyle={C.secondary}>★ {item.rating}/5</Text> : null}</HStack>{item.description ? <Text font="subheadline" foregroundStyle={C.secondary}>{item.description}</Text> : null}{item.genres.length ? <Text font="caption" foregroundStyle={C.tertiary}>{item.genres.join(' · ')}</Text> : null}<Text font="headline" bold foregroundStyle={C.text}>Staffeln</Text><ScrollView axes="horizontal" scrollIndicator="hidden"><HStack spacing={8}>{[...item.seasons, 0].map(value => <Button key={value} title={value === 0 ? 'Filme' : 'S' + value} foregroundStyle={season === value ? C.text : C.secondary} background={season === value ? C.accent : C.surface} action={() => choose(value)} />)}</HStack></ScrollView><Text font="headline" bold foregroundStyle={C.text}>{season === 0 ? 'Filme' : 'Episoden'}</Text><VStack spacing={8}>{list.length ? list.map(episode => <Button key={episode.number} action={() => openStreams(slug, episode.season, episode.number, episode.film)}><HStack padding={14} spacing={12} background={C.surface}><Text bold foregroundStyle={C.accent} frame={{ width: 34 }}>{episode.number}</Text><Text foregroundStyle={C.text} lineLimit={1} frame={{ maxWidth: 'infinity' }}>{episode.title}</Text><Image systemName="play.fill" foregroundStyle={C.tertiary} font="caption" /></HStack></Button>) : <Loading label="Lade Episoden …" />}</VStack></VStack></ScrollView> }
+const StreamScreen = ({ slug, season, episode, film }: { slug: string; season: number; episode: number; film: boolean }) => { const [items, setItems] = useState<Stream[]>([]), [busy, setBusy] = useState(true), [error, setError] = useState(''); const load = async () => { setBusy(true); setError(''); try { setItems(await streams(slug, season, episode, film)) } catch (e) { setError(String(e)) } finally { setBusy(false) } }; const open = (stream: Stream) => { addHistory({ slug, title: titleFromSlug(slug), season, episode, film, watchedAt: Date.now() }); openPlayer(stream, titleFromSlug(slug), season, episode, film) }; useEffect(() => { load() }, [slug, season, episode]); return <ScrollView navigationTitle={film ? 'Film ' + episode : 'S' + season + ' · E' + episode} background={C.bg}><VStack padding={{ horizontal: 16, bottom: 50 }} spacing={10} alignment="leading"><Text font="subheadline" foregroundStyle={C.secondary}>Wähle eine verfügbare Quelle.</Text>{busy ? <Loading label="Lade Quellen …" /> : error ? <Failure message={error} retry={load} /> : items.length ? items.map(stream => <Button key={stream.hoster + stream.href} action={() => open(stream)}><HStack padding={16} spacing={12} background={C.surface}><ZStack frame={{ width: 38, height: 38 }} background={C.surface2}><Image systemName="play.fill" foregroundStyle={C.accent} /></ZStack><VStack alignment="leading" spacing={3} frame={{ maxWidth: 'infinity' }}><Text bold foregroundStyle={C.text}>{stream.hoster}</Text><Text font="caption" foregroundStyle={C.secondary}>{stream.language}</Text></VStack><Image systemName="play.rectangle" foregroundStyle={C.tertiary} /></HStack></Button>) : <ContentUnavailableView title="Keine Quelle gefunden" systemImage="play.slash" description="Die Episode liefert derzeit keine auslesbaren Quellen." />}</VStack></ScrollView> }
 
-const HistoryTab = () => {
-  useStoreTick(); const items = getHistory()
-  return <NavigationStack><ScrollView navigationTitle="Verlauf" background={C.bg} toolbar={{ confirmationAction: items.length ? <Button title="Leeren" foregroundStyle={C.accent} action={() => { haptic.destructive(); clearHistory() }} /> : undefined }}>
-    <VStack padding={{ horizontal: 16, bottom: 100 }} spacing={12} alignment="leading">
-      {items.length ? items.map(item => <Button key={item.slug + item.season + item.episode} action={() => openStreamList(item.slug, item.season, item.episode, item.film)}><HStack padding={14} spacing={12} background={C.surface} frame={{ maxWidth: 'infinity' }}><Image systemName="clock.arrow.circlepath" foregroundStyle={C.accent} font="title3" /><VStack alignment="leading" spacing={3} frame={{ maxWidth: 'infinity', alignment: 'leading' }}><Text bold foregroundStyle={C.text} lineLimit={1}>{item.title}</Text><Text font="caption" foregroundStyle={C.secondary}>{item.film ? 'Film ' : 'S' + item.season + ' · E'}{item.episode}</Text></VStack><Image systemName="chevron.right" foregroundStyle={C.tertiary} font="caption" /></HStack></Button>) : <ContentUnavailableView title="Noch kein Verlauf" systemImage="clock" description="Hier erscheinen geöffnete Episoden." />}
-    </VStack>
-  </ScrollView></NavigationStack>
-}
-
-const MoreTab = () => {
-  useStoreTick(); const config = getSettings(); const [autoOpen, setAutoOpen] = useState(config.autoOpenProvider); const [debug, setDebug] = useState(config.showDebug)
-  const save = (next: Partial<Settings>) => { const value = { ...getSettings(), ...next }; saveSettings(value) }
-  return <NavigationStack><ScrollView navigationTitle="Mehr" background={C.bg}>
-    <VStack padding={{ horizontal: 16, bottom: 100 }} spacing={20} alignment="leading">
-      <VStack padding={16} spacing={12} alignment="leading" background={C.surface}><Text font="headline" bold foregroundStyle={C.text}>Wiedergabe</Text><Toggle title="Provider direkt öffnen" isOn={autoOpen} onChanged={(v) => { setAutoOpen(v); save({ autoOpenProvider: v }); haptic.select() }} /></VStack>
-      <VStack padding={16} spacing={12} alignment="leading" background={C.surface}><Text font="headline" bold foregroundStyle={C.text}>Entwicklung</Text><Toggle title="Debug-Hinweise" isOn={debug} onChanged={(v) => { setDebug(v); save({ showDebug: v }); haptic.select() }} /><Button title="Cache leeren" foregroundStyle={C.accent} action={() => { haptic.destructive(); clearCache() }} /></VStack>
-      <VStack spacing={5} alignment="leading"><Text foregroundStyle={C.secondary}>AniWorld v{VERSION}</Text><Text font="caption" foregroundStyle={C.tertiary}>Single-file Scripting-App mit nativer Navigation.</Text></VStack>
-    </VStack>
-  </ScrollView></NavigationStack>
-}
-
-const DetailScreen = ({ slug }: { slug: string }) => {
-  const [detail, setDetail] = useState<Detail | null>(null), [season, setSeason] = useState(1), [episodes, setEpisodes] = useState<Episode[]>([]), [loading, setLoading] = useState(true), [error, setError] = useState(''), [saved, setSaved] = useState(inWatchlist(slug))
-  const loadDetail = async () => { setLoading(true); setError(''); try { const value = await fetchDetail(slug); setDetail(value); const defaultSeason = value.seasons[0] || 1; setSeason(defaultSeason); setEpisodes(await fetchEpisodes(slug, defaultSeason)) } catch (e) { setError(String(e)) } finally { setLoading(false) } }
-  const loadSeason = async (value: number) => { haptic.select(); setSeason(value); setEpisodes([]); try { setEpisodes(await fetchEpisodes(slug, value)) } catch (e) { setError(String(e)) } }
-  useEffect(() => { loadDetail() }, [slug])
-  if (loading) return <ScrollView navigationTitle="Anime" background={C.bg}><Loading /></ScrollView>
-  if (error || !detail) return <ScrollView navigationTitle="Anime" background={C.bg}><ErrorState message={error || 'Nicht gefunden'} retry={loadDetail} /></ScrollView>
-  return <ScrollView navigationTitle={detail.title} background={C.bg} toolbar={{ confirmationAction: <Button action={() => { toggleWatchlist(detail); setSaved(!saved); haptic.success() }}><Image systemName={saved ? 'bookmark.fill' : 'bookmark'} foregroundStyle={C.accent} /></Button> }}>
-    <VStack padding={{ horizontal: 16, bottom: 50 }} spacing={16} alignment="leading">
-      <ZStack frame={{ maxWidth: 'infinity', height: 220 }} background={C.surface2}><Image systemName="play.rectangle.fill" font="system" foregroundStyle={C.tertiary} /></ZStack>
-      <VStack spacing={6} alignment="leading"><Text font="title2" bold foregroundStyle={C.text}>{detail.title}</Text><HStack spacing={10}>{detail.year ? <Text font="caption" foregroundStyle={C.secondary}>{detail.year}</Text> : null}{detail.rating ? <Text font="caption" foregroundStyle={C.secondary}>★ {detail.rating}/5</Text> : null}</HStack></VStack>
-      {detail.description ? <Text font="subheadline" foregroundStyle={C.secondary}>{detail.description}</Text> : null}
-      {detail.genres.length ? <Text font="caption" foregroundStyle={C.tertiary}>{detail.genres.join(' · ')}</Text> : null}
-      <Text font="headline" bold foregroundStyle={C.text}>Staffel</Text>
-      <ScrollView axes="horizontal" scrollIndicator="hidden"><HStack spacing={8}>{[...detail.seasons, 0].map(value => <Button key={value} title={value === 0 ? 'Filme' : 'S' + value} foregroundStyle={season === value ? C.text : C.secondary} background={season === value ? C.accent : C.surface} action={() => loadSeason(value)} />)}</HStack></ScrollView>
-      <Text font="headline" bold foregroundStyle={C.text}>{season === 0 ? 'Filme' : 'Episoden'}</Text>
-      <VStack spacing={8} frame={{ maxWidth: 'infinity' }}>{episodes.length ? episodes.map(item => <Button key={item.number} action={() => openStreamList(slug, item.season, item.number, item.film)}><HStack padding={14} background={C.surface} frame={{ maxWidth: 'infinity' }}><Text bold foregroundStyle={C.accent} frame={{ width: 34 }}>{item.number}</Text><Text foregroundStyle={C.text} lineLimit={1} frame={{ maxWidth: 'infinity', alignment: 'leading' }}>{item.title}</Text><Image systemName="play.fill" foregroundStyle={C.tertiary} font="caption" /></HStack></Button>) : <Loading label="Lade Episoden …" />}</VStack>
-    </VStack>
-  </ScrollView>
-}
-
-const StreamScreen = ({ slug, season, episode, film }: { slug: string; season: number; episode: number; film: boolean }) => {
-  const [streams, setStreams] = useState<Stream[]>([]), [loading, setLoading] = useState(true), [error, setError] = useState('')
-  const load = async () => { setLoading(true); setError(''); try { setStreams(await fetchStreams(slug, season, episode, film)) } catch (e) { setError(String(e)) } finally { setLoading(false) } }
-  useEffect(() => { load() }, [slug, season, episode])
-  const open = async (stream: Stream) => {
-    addHistory({ slug, title: titleFromSlug(slug), season, episode, film, watchedAt: Date.now() })
-    haptic.nav(); await Safari.openURL(stream.href)
-  }
-  return <ScrollView navigationTitle={film ? 'Film ' + episode : 'S' + season + ' · E' + episode} background={C.bg}>
-    <VStack padding={{ horizontal: 16, bottom: 50 }} spacing={10} alignment="leading">
-      <Text font="subheadline" foregroundStyle={C.secondary}>Wähle einen verfügbaren Provider.</Text>
-      {loading ? <Loading label="Lade Provider …" /> : error ? <ErrorState message={error} retry={load} /> : streams.length ? streams.map(stream => <Button key={stream.hoster + stream.href} action={() => open(stream)}><HStack padding={16} background={C.surface} frame={{ maxWidth: 'infinity' }}><VStack frame={{ width: 38, height: 38 }} alignment="center" background={C.surface2}><Image systemName="play.fill" foregroundStyle={C.accent} /></VStack><VStack alignment="leading" spacing={3} frame={{ maxWidth: 'infinity', alignment: 'leading' }}><Text bold foregroundStyle={C.text}>{stream.hoster}</Text><Text font="caption" foregroundStyle={C.secondary}>{stream.language}</Text></VStack><Image systemName="arrow.up.right.square" foregroundStyle={C.tertiary} /></HStack></Button>) : <ContentUnavailableView title="Keine Provider gefunden" systemImage="play.slash" description="Die Episode liefert derzeit keine auslesbaren Provider-Links." />}
-    </VStack>
-  </ScrollView>
-}
-
-const RootApp = () => {
-  const [tab, setTab] = useState('home')
-  return <TabView selected={tab} onChanged={(value) => { setTab(value); haptic.select() }} background={C.bg} tabBarBackground={C.bg} tabBarColorScheme="dark" tabBarSelectedForeground={C.accent} tabBarUnselectedForeground={C.tertiary}>
-    <Tab value="home" label="Home" icon="house" selectedIcon="house.fill"><HomeTab /></Tab>
-    <Tab value="search" label="Suche" icon="magnifyingglass" selectedIcon="magnifyingglass"><SearchTab /></Tab>
-    <Tab value="watchlist" label="Watchlist" icon="bookmark" selectedIcon="bookmark.fill"><WatchlistTab /></Tab>
-    <Tab value="history" label="Verlauf" icon="clock" selectedIcon="clock.fill"><HistoryTab /></Tab>
-    <Tab value="more" label="Mehr" icon="ellipsis" selectedIcon="ellipsis"><MoreTab /></Tab>
-  </TabView>
-}
-
-Navigation.present({ element: <RootApp /> })
+const App = () => { const [tab, setTab] = useState('home'); return <TabView selected={tab} onChanged={value => { setTab(value); tap.select() }} background={C.bg} tabBarBackground={C.bg} tabBarColorScheme="dark" tabBarSelectedForeground={C.accent} tabBarUnselectedForeground={C.tertiary}><Tab value="home" label="Home" icon="house" selectedIcon="house.fill"><HomeTab /></Tab><Tab value="search" label="Suche" icon="magnifyingglass" selectedIcon="magnifyingglass"><SearchTab /></Tab><Tab value="watchlist" label="Watchlist" icon="bookmark" selectedIcon="bookmark.fill"><WatchlistTab /></Tab><Tab value="history" label="Verlauf" icon="clock" selectedIcon="clock.fill"><HistoryTab /></Tab><Tab value="more" label="Mehr" icon="ellipsis" selectedIcon="ellipsis"><MoreTab /></Tab></TabView> }
+Navigation.present({ element: <App /> })
